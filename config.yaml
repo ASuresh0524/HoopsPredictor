@@ -1,0 +1,44 @@
+data:
+  team_data_path: "TeamData.sqlite"
+  player_data_path: "dataset.sqlite"
+  train_start_date: "2012-01-01"
+  train_end_date: "2023-06-30"
+  val_start_date: "2023-07-01"
+  val_end_date: "2023-12-31"
+  test_start_date: "2024-01-01"
+  test_end_date: "2024-04-29"
+
+feature_engineering:
+  rolling_windows: [5, 10, 20]
+  momentum_windows: [3, 5, 10]
+  head2head_lookback_days: 365
+
+models:
+  bradley_terry:
+    learning_rate: 0.01
+    max_iterations: 1000
+    convergence_threshold: 1e-6
+    regularization: 0.1
+
+  time_series:
+    lstm:
+      hidden_size: 128
+      num_layers: 2
+      dropout: 0.2
+      learning_rate: 0.001
+      batch_size: 32
+      epochs: 50
+      sequence_length: 10
+
+evaluation:
+  metrics:
+    - accuracy
+    - precision
+    - recall
+    - f1
+    - log_loss
+    - brier_score
+
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s" 
