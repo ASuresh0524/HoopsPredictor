@@ -1,41 +1,35 @@
 import numpy as np
 import pandas as pd
-from typing import Dict, List, Tuple, Optional
-import yaml
+from typing import Dict, List, Optional
 import logging
-from scipy.optimize import minimize
+import yaml
+import joblib
 from sklearn.preprocessing import StandardScaler
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from sklearn.metrics import (
+    mean_absolute_error,
+    mean_squared_error,
+    log_loss,
+    brier_score_loss,
+    accuracy_score
+)
 
 class BradleyTerryPredictor:
-    """
-    Implementation of Bradley-Terry model for predicting game outcomes.
-    
-    The model estimates team strengths and uses them to predict win probabilities.
-    It can incorporate player statistics and other features into the team strength estimation.
-    """
-    
-    def __init__(self, config_path: str = "config.yaml"):
-        """
-        Initialize the predictor with configuration settings.
-        
-        Args:
-            config_path (str): Path to the configuration file
-        """
+    def __init__(self, config_path="config.yaml"):
+        """Initialize the Bradley-Terry predictor with configuration."""
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
-            
-        self.learning_rate = self.config['models']['bradley_terry']['learning_rate']
-        self.max_iterations = self.config['models']['bradley_terry']['max_iterations']
-        self.convergence_threshold = self.config['models']['bradley_terry']['convergence_threshold']
-        self.regularization = self.config['models']['bradley_terry']['regularization']
         
-        self.team_strengths = {}
-        self.feature_scaler = StandardScaler()
+        # Model parameters
+        self.learning_rate = self.config['models']['game_predictor']['learning_rate']
+        self.batch_size = self.config['models']['game_predictor']['batch_size']
+        self.epochs = self.config['models']['game_predictor']['epochs']
+        self.early_stopping_patience = self.config['models']['game_predictor']['early_stopping_patience']
+        
+        # Initialize model parameters
+        self.team_ratings = {}
+        self.scaler = StandardScaler()
         self.setup_logging()
-        
+
     def setup_logging(self):
         """Set up logging configuration."""
         logging.basicConfig(
@@ -43,205 +37,190 @@ class BradleyTerryPredictor:
             format=self.config['logging']['format']
         )
         self.logger = logging.getLogger(__name__)
-        
-    def _prepare_features(self, df: pd.DataFrame, feature_cols: List[str]) -> np.ndarray:
+
+    def _initialize_ratings(self, teams: List[str]):
+        """Initialize team ratings."""
+        for team in teams:
+            if team not in self.team_ratings:
+                self.team_ratings[team] = np.random.normal(0, 0.1)
+
+    def _calculate_win_probability(self, home_rating: float, away_rating: float) -> float:
+        """Calculate win probability using Bradley-Terry model."""
+        return 1 / (1 + np.exp(-(home_rating - away_rating)))
+
+    def train(
+        self,
+        game_data: pd.DataFrame,
+        save_path: Optional[str] = None
+    ) -> Dict:
         """
-        Prepare and scale features for the model.
+        Train the Bradley-Terry model on historical game data.
         
         Args:
-            df (pd.DataFrame): Input DataFrame
-            feature_cols (List[str]): Feature column names
+            game_data (pd.DataFrame): Game data with features
+            save_path (str, optional): Path to save the trained model
             
         Returns:
-            np.ndarray: Scaled features
+            Dict: Training history
         """
-        return self.feature_scaler.fit_transform(df[feature_cols])
+        # Initialize team ratings
+        teams = pd.concat([
+            game_data['HOME_TEAM'],
+            game_data['AWAY_TEAM']
+        ]).unique()
+        self._initialize_ratings(teams)
         
-    def _negative_log_likelihood(self, 
-                               strengths: np.ndarray,
-                               home_indices: np.ndarray,
-                               away_indices: np.ndarray,
-                               outcomes: np.ndarray,
-                               features: Optional[np.ndarray] = None) -> float:
+        # Scale features
+        feature_cols = [col for col in game_data.columns if 'DIFF' in col]
+        if feature_cols:
+            self.scaler.fit(game_data[feature_cols])
+        
+        # Training loop
+        history = {
+            'loss': [],
+            'val_loss': []
+        }
+        
+        best_loss = float('inf')
+        patience_counter = 0
+        
+        for epoch in range(self.epochs):
+            epoch_loss = 0
+            
+            # Update ratings
+            for _, game in game_data.iterrows():
+                home_team = game['HOME_TEAM']
+                away_team = game['AWAY_TEAM']
+                
+                # Get current ratings
+                home_rating = self.team_ratings[home_team]
+                away_rating = self.team_ratings[away_team]
+                
+                # Calculate predicted probability
+                pred_prob = self._calculate_win_probability(home_rating, away_rating)
+                
+                # Get actual outcome
+                actual_outcome = game['HOME_WIN']
+                
+                # Calculate gradient and update ratings
+                error = actual_outcome - pred_prob
+                gradient = error * pred_prob * (1 - pred_prob)
+                
+                self.team_ratings[home_team] += self.learning_rate * gradient
+                self.team_ratings[away_team] -= self.learning_rate * gradient
+                
+                epoch_loss += -actual_outcome * np.log(pred_prob) - (1 - actual_outcome) * np.log(1 - pred_prob)
+            
+            avg_loss = epoch_loss / len(game_data)
+            history['loss'].append(avg_loss)
+            
+            # Early stopping
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                patience_counter = 0
+                if save_path:
+                    self.save(save_path)
+            else:
+                patience_counter += 1
+                if patience_counter >= self.early_stopping_patience:
+                    self.logger.info(f"Early stopping at epoch {epoch}")
+                    break
+            
+            if epoch % 10 == 0:
+                self.logger.info(f"Epoch {epoch}: Loss = {avg_loss:.4f}")
+        
+        return history
+
+    def predict(self, game_features: pd.DataFrame) -> Dict:
         """
-        Calculate negative log likelihood of the Bradley-Terry model.
+        Predict game outcomes.
         
         Args:
-            strengths (np.ndarray): Team strength parameters
-            home_indices (np.ndarray): Indices of home teams
-            away_indices (np.ndarray): Indices of away teams
-            outcomes (np.ndarray): Game outcomes (1 for home win, 0 for away win)
-            features (np.ndarray, optional): Additional features to modify team strengths
+            game_features (pd.DataFrame): Game features
             
         Returns:
-            float: Negative log likelihood
+            Dict: Predictions including win probability, spread, and total
         """
-        # Get base team strengths
-        home_strengths = strengths[home_indices]
-        away_strengths = strengths[away_indices]
+        predictions = {}
         
-        # Modify strengths with features if provided
-        if features is not None:
-            feature_weights = strengths[len(self.team_strengths):]
-            home_strengths += np.dot(features, feature_weights)
-            away_strengths += np.dot(features, feature_weights)
+        for _, game in game_features.iterrows():
+            home_team = game['HOME_TEAM']
+            away_team = game['AWAY_TEAM']
             
-        # Calculate win probabilities
-        prob_home_wins = 1 / (1 + np.exp(-(home_strengths - away_strengths)))
-        
-        # Calculate log likelihood
-        log_likelihood = np.sum(
-            outcomes * np.log(prob_home_wins) + 
-            (1 - outcomes) * np.log(1 - prob_home_wins)
-        )
-        
-        # Add regularization term
-        regularization = self.regularization * np.sum(strengths ** 2)
-        
-        return -log_likelihood + regularization
-        
-    def fit(self, 
-            df: pd.DataFrame,
-            home_team_col: str,
-            away_team_col: str,
-            outcome_col: str,
-            feature_cols: Optional[List[str]] = None) -> Dict[str, float]:
-        """
-        Fit the Bradley-Terry model to game data.
-        
-        Args:
-            df (pd.DataFrame): Game data
-            home_team_col (str): Column name for home team
-            away_team_col (str): Column name for away team
-            outcome_col (str): Column name for game outcome
-            feature_cols (List[str], optional): Additional feature columns
+            # Get team ratings
+            home_rating = self.team_ratings.get(home_team, 0)
+            away_rating = self.team_ratings.get(away_team, 0)
             
-        Returns:
-            Dict[str, float]: Estimated team strengths
-        """
-        # Create team ID mapping
-        unique_teams = pd.unique(df[[home_team_col, away_team_col]].values.ravel())
-        self.team_strengths = {team: idx for idx, team in enumerate(unique_teams)}
-        
-        # Convert teams to indices
-        home_indices = df[home_team_col].map(self.team_strengths).values
-        away_indices = df[away_team_col].map(self.team_strengths).values
-        outcomes = df[outcome_col].values
-        
-        # Prepare features if provided
-        features = None
-        if feature_cols is not None:
-            features = self._prepare_features(df, feature_cols)
+            # Calculate base probability from ratings
+            base_prob = self._calculate_win_probability(home_rating, away_rating)
             
-        # Initialize parameters
-        n_params = len(self.team_strengths)
-        if features is not None:
-            n_params += features.shape[1]  # Add feature weights
+            # Adjust probability using features
+            feature_cols = [col for col in game_features.columns if 'DIFF' in col]
+            if feature_cols:
+                features = game[feature_cols].values.reshape(1, -1)
+                scaled_features = self.scaler.transform(features)
+                feature_adjustment = np.mean(scaled_features) * 0.1  # Small adjustment based on features
+                
+                win_probability = np.clip(base_prob + feature_adjustment, 0.01, 0.99)
+            else:
+                win_probability = base_prob
             
-        initial_strengths = np.zeros(n_params)
-        
-        # Optimize parameters
-        result = minimize(
-            self._negative_log_likelihood,
-            initial_strengths,
-            args=(home_indices, away_indices, outcomes, features),
-            method='BFGS',
-            options={
-                'maxiter': self.max_iterations,
-                'gtol': self.convergence_threshold
+            # Calculate spread and total
+            rating_diff = home_rating - away_rating
+            predicted_spread = rating_diff * 5  # Convert rating difference to points
+            predicted_total = 220 + rating_diff  # Base total adjusted by rating difference
+            
+            predictions = {
+                'win_probability': win_probability,
+                'spread': predicted_spread,
+                'total': predicted_total
             }
-        )
         
-        if not result.success:
-            self.logger.warning(f"Optimization did not converge: {result.message}")
+        return predictions
+
+    def evaluate(self, game_data: pd.DataFrame) -> Dict:
+        """
+        Evaluate model performance on test data.
+        
+        Args:
+            game_data (pd.DataFrame): Game data with actual outcomes
             
-        # Extract and store team strengths
-        final_strengths = result.x[:len(self.team_strengths)]
-        strength_dict = {
-            team: float(final_strengths[idx])
-            for team, idx in self.team_strengths.items()
+        Returns:
+            Dict: Evaluation metrics
+        """
+        y_true = game_data['HOME_WIN'].values
+        y_pred_proba = []
+        spreads = []
+        totals = []
+        
+        for _, game in game_data.iterrows():
+            predictions = self.predict(pd.DataFrame([game]))
+            y_pred_proba.append(predictions['win_probability'])
+            spreads.append(predictions['spread'])
+            totals.append(predictions['total'])
+        
+        y_pred = np.array(y_pred_proba) > 0.5
+        
+        return {
+            'accuracy': accuracy_score(y_true, y_pred),
+            'log_loss': log_loss(y_true, y_pred_proba),
+            'brier_score': brier_score_loss(y_true, y_pred_proba),
+            'spread_mae': mean_absolute_error(game_data['HOME_PTS'] - game_data['AWAY_PTS'], spreads),
+            'total_mae': mean_absolute_error(game_data['HOME_PTS'] + game_data['AWAY_PTS'], totals)
         }
-        
-        # Store feature weights if used
-        if features is not None:
-            self.feature_weights = result.x[len(self.team_strengths):]
-            
-        return strength_dict
-        
-    def predict_proba(self,
-                     home_team: str,
-                     away_team: str,
-                     features: Optional[np.ndarray] = None) -> float:
-        """
-        Predict win probability for a game.
-        
-        Args:
-            home_team (str): Home team identifier
-            away_team (str): Away team identifier
-            features (np.ndarray, optional): Additional features
-            
-        Returns:
-            float: Probability of home team winning
-        """
-        if home_team not in self.team_strengths or away_team not in self.team_strengths:
-            raise ValueError("Unknown team(s) provided")
-            
-        home_strength = self.team_strengths[home_team]
-        away_strength = self.team_strengths[away_team]
-        
-        # Modify strengths with features if provided
-        if features is not None and hasattr(self, 'feature_weights'):
-            scaled_features = self.feature_scaler.transform(features.reshape(1, -1))
-            home_strength += np.dot(scaled_features, self.feature_weights)
-            away_strength += np.dot(scaled_features, self.feature_weights)
-            
-        return 1 / (1 + np.exp(-(home_strength - away_strength)))
-        
-    def get_team_rankings(self) -> pd.DataFrame:
-        """
-        Get current team rankings based on estimated strengths.
-        
-        Returns:
-            pd.DataFrame: Team rankings with strengths
-        """
-        rankings = pd.DataFrame([
-            {'team': team, 'strength': strength}
-            for team, strength in self.team_strengths.items()
-        ])
-        
-        return rankings.sort_values('strength', ascending=False).reset_index(drop=True)
-        
-    def save_model(self, path: str):
-        """
-        Save the model parameters.
-        
-        Args:
-            path (str): Path to save the model
-        """
+
+    def save(self, path: str):
+        """Save the model to disk."""
         model_state = {
-            'team_strengths': self.team_strengths,
-            'feature_scaler': self.feature_scaler
+            'team_ratings': self.team_ratings,
+            'scaler': self.scaler
         }
-        
-        if hasattr(self, 'feature_weights'):
-            model_state['feature_weights'] = self.feature_weights
-            
-        np.save(path, model_state)
+        joblib.dump(model_state, path)
         self.logger.info(f"Model saved to {path}")
-        
-    def load_model(self, path: str):
-        """
-        Load model parameters.
-        
-        Args:
-            path (str): Path to the saved model
-        """
-        model_state = np.load(path, allow_pickle=True).item()
-        
-        self.team_strengths = model_state['team_strengths']
-        self.feature_scaler = model_state['feature_scaler']
-        
-        if 'feature_weights' in model_state:
-            self.feature_weights = model_state['feature_weights']
-            
+
+    def load(self, path: str):
+        """Load the model from disk."""
+        model_state = joblib.load(path)
+        self.team_ratings = model_state['team_ratings']
+        self.scaler = model_state['scaler']
         self.logger.info(f"Model loaded from {path}") 

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.optim as optim
 import numpy as np
 import pandas as pd
 from typing import List, Dict, Tuple, Optional
@@ -7,6 +8,7 @@ import yaml
 import logging
 from sklearn.preprocessing import StandardScaler
 from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -121,13 +123,14 @@ class PlayerStatsPredictor:
             self.config = yaml.safe_load(f)
             
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.sequence_length = self.config['models']['time_series']['lstm']['sequence_length']
-        self.hidden_size = self.config['models']['time_series']['lstm']['hidden_size']
-        self.num_layers = self.config['models']['time_series']['lstm']['num_layers']
-        self.dropout = self.config['models']['time_series']['lstm']['dropout']
-        self.learning_rate = self.config['models']['time_series']['lstm']['learning_rate']
-        self.batch_size = self.config['models']['time_series']['lstm']['batch_size']
-        self.epochs = self.config['models']['time_series']['lstm']['epochs']
+        self.sequence_length = self.config['models']['player_predictor']['sequence_length']
+        self.hidden_size = self.config['models']['player_predictor']['hidden_size']
+        self.num_layers = self.config['models']['player_predictor']['num_layers']
+        self.dropout = self.config['models']['player_predictor']['dropout']
+        self.learning_rate = self.config['models']['player_predictor']['learning_rate']
+        self.batch_size = self.config['models']['player_predictor']['batch_size']
+        self.epochs = self.config['models']['player_predictor']['epochs']
+        self.early_stopping_patience = self.config['models']['player_predictor']['early_stopping_patience']
         
         self.target_cols = ['PTS', 'REB', 'AST', 'STL', 'BLK']
         self.model = None
@@ -142,231 +145,239 @@ class PlayerStatsPredictor:
         )
         self.logger = logging.getLogger(__name__)
         
-    def prepare_data(
+    def prepare_sequences(
         self,
-        data: pd.DataFrame
-    ) -> Tuple[PlayerStatsDataset, PlayerStatsDataset, PlayerStatsDataset]:
+        data: pd.DataFrame,
+        sequence_length: int
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Prepare training, validation, and test datasets.
+        Prepare sequences for LSTM training.
         
         Args:
             data (pd.DataFrame): Player statistics data
+            sequence_length (int): Length of input sequences
             
         Returns:
-            Tuple[PlayerStatsDataset, PlayerStatsDataset, PlayerStatsDataset]:
-                Training, validation, and test datasets
+            Tuple[np.ndarray, np.ndarray]: Input sequences and target values
         """
-        # Sort by date
-        data = data.sort_values('Date')
+        sequences = []
+        targets = []
         
-        # Split data
-        train_end = pd.to_datetime(self.config['data']['train_end_date'])
-        val_end = pd.to_datetime(self.config['data']['val_end_date'])
+        # Sort by player and date
+        data = data.sort_values(['PLAYER_NAME', 'Date'])
         
-        train_data = data[data['Date'] <= train_end]
-        val_data = data[
-            (data['Date'] > train_end) &
-            (data['Date'] <= val_end)
-        ]
-        test_data = data[data['Date'] > val_end]
+        # Group by player
+        for _, player_data in data.groupby('PLAYER_NAME'):
+            if len(player_data) < sequence_length + 1:
+                continue
+            
+            # Get feature columns
+            feature_cols = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'MIN']
+            features = player_data[feature_cols].values
+            
+            # Create sequences
+            for i in range(len(features) - sequence_length):
+                sequences.append(features[i:i + sequence_length])
+                targets.append(features[i + sequence_length])
         
-        # Create datasets
-        train_dataset = PlayerStatsDataset(
-            train_data,
-            self.sequence_length,
-            self.target_cols
-        )
-        val_dataset = PlayerStatsDataset(
-            val_data,
-            self.sequence_length,
-            self.target_cols
-        )
-        test_dataset = PlayerStatsDataset(
-            test_data,
-            self.sequence_length,
-            self.target_cols
-        )
-        
-        return train_dataset, val_dataset, test_dataset
-        
+        return np.array(sequences), np.array(targets)
+
     def train(
         self,
-        train_dataset: PlayerStatsDataset,
-        val_dataset: PlayerStatsDataset
-    ) -> Dict[str, List[float]]:
+        data: pd.DataFrame,
+        save_path: Optional[str] = None
+    ) -> Dict:
         """
-        Train the LSTM model.
+        Train the LSTM model on player statistics data.
         
         Args:
-            train_dataset (PlayerStatsDataset): Training dataset
-            val_dataset (PlayerStatsDataset): Validation dataset
+            data (pd.DataFrame): Player statistics data
+            save_path (str, optional): Path to save the trained model
             
         Returns:
-            Dict[str, List[float]]: Training history
+            Dict: Training history
         """
-        # Initialize model
+        # Prepare sequences
+        X, y = self.prepare_sequences(data, self.sequence_length)
+        
+        # Scale data
+        X_reshaped = X.reshape(-1, X.shape[-1])
+        y_reshaped = y.reshape(-1, y.shape[-1])
+        
+        self.feature_scaler = StandardScaler()
+        self.target_scaler = StandardScaler()
+        
+        self.feature_scaler.fit(X_reshaped)
+        self.target_scaler.fit(y_reshaped)
+        
+        X_scaled = self.feature_scaler.transform(X_reshaped).reshape(X.shape)
+        y_scaled = self.target_scaler.transform(y_reshaped).reshape(y.shape)
+        
+        # Convert to tensors
+        X_tensor = torch.FloatTensor(X_scaled).to(self.device)
+        y_tensor = torch.FloatTensor(y_scaled).to(self.device)
+        
+        # Create model
         self.model = PlayerStatsLSTM(
-            input_size=len(self.target_cols),
+            input_size=X.shape[-1],
             hidden_size=self.hidden_size,
             num_layers=self.num_layers,
             dropout=self.dropout
         ).to(self.device)
         
-        # Create data loaders
-        train_loader = DataLoader(
-            train_dataset,
-            batch_size=self.batch_size,
-            shuffle=True
-        )
-        val_loader = DataLoader(
-            val_dataset,
-            batch_size=self.batch_size
-        )
-        
-        # Initialize optimizer and loss function
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=self.learning_rate)
+        # Training setup
         criterion = nn.MSELoss()
+        optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate)
         
-        # Training history
+        # Training loop
         history = {
-            'train_loss': [],
+            'loss': [],
             'val_loss': []
         }
         
-        # Training loop
+        best_loss = float('inf')
+        patience_counter = 0
+        
         for epoch in range(self.epochs):
-            # Training phase
             self.model.train()
-            train_losses = []
+            epoch_loss = 0
             
-            for inputs, targets in train_loader:
-                inputs = inputs.to(self.device)
-                targets = targets.to(self.device)
+            # Mini-batch training
+            for i in range(0, len(X_tensor), self.batch_size):
+                batch_X = X_tensor[i:i + self.batch_size]
+                batch_y = y_tensor[i:i + self.batch_size]
                 
                 optimizer.zero_grad()
-                outputs = self.model(inputs)
-                loss = criterion(outputs, targets)
+                predictions = self.model(batch_X)
+                loss = criterion(predictions, batch_y)
                 
                 loss.backward()
                 optimizer.step()
                 
-                train_losses.append(loss.item())
+                epoch_loss += loss.item()
             
-            # Validation phase
-            self.model.eval()
-            val_losses = []
+            avg_loss = epoch_loss / (len(X_tensor) / self.batch_size)
+            history['loss'].append(avg_loss)
             
-            with torch.no_grad():
-                for inputs, targets in val_loader:
-                    inputs = inputs.to(self.device)
-                    targets = targets.to(self.device)
-                    
-                    outputs = self.model(inputs)
-                    loss = criterion(outputs, targets)
-                    
-                    val_losses.append(loss.item())
+            # Early stopping
+            if avg_loss < best_loss:
+                best_loss = avg_loss
+                patience_counter = 0
+                if save_path:
+                    torch.save({
+                        'model_state_dict': self.model.state_dict(),
+                        'feature_scaler': self.feature_scaler,
+                        'target_scaler': self.target_scaler
+                    }, save_path)
+            else:
+                patience_counter += 1
+                if patience_counter >= self.early_stopping_patience:
+                    self.logger.info(f"Early stopping at epoch {epoch}")
+                    break
             
-            # Record losses
-            avg_train_loss = np.mean(train_losses)
-            avg_val_loss = np.mean(val_losses)
-            
-            history['train_loss'].append(avg_train_loss)
-            history['val_loss'].append(avg_val_loss)
-            
-            self.logger.info(
-                f"Epoch {epoch + 1}/{self.epochs} - "
-                f"Train Loss: {avg_train_loss:.4f} - "
-                f"Val Loss: {avg_val_loss:.4f}"
-            )
+            if epoch % 10 == 0:
+                self.logger.info(f"Epoch {epoch}: Loss = {avg_loss:.4f}")
         
         return history
-        
+
     def predict(
         self,
-        sequence: pd.DataFrame
-    ) -> Dict[str, float]:
+        player_history: pd.DataFrame,
+        opponent: str,
+        date: str
+    ) -> Dict:
         """
-        Predict player statistics for the next game.
+        Predict player statistics for an upcoming game.
         
         Args:
-            sequence (pd.DataFrame): Recent game statistics
+            player_history (pd.DataFrame): Player's recent game history
+            opponent (str): Opponent team name/code
+            date (str): Game date
             
         Returns:
-            Dict[str, float]: Predicted statistics
+            Dict: Predicted statistics
         """
-        if self.model is None:
-            raise ValueError("Model not trained")
-        
-        if len(sequence) < self.sequence_length:
-            raise ValueError(
-                f"Sequence length must be at least {self.sequence_length}"
-            )
-        
         # Prepare input sequence
-        input_sequence = sequence.tail(self.sequence_length)[self.target_cols].values
-        input_tensor = torch.FloatTensor(input_sequence).unsqueeze(0).to(self.device)
+        feature_cols = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'MIN']
+        recent_games = player_history.sort_values('Date').tail(self.sequence_length)
         
-        # Make prediction
+        if len(recent_games) < self.sequence_length:
+            raise ValueError(f"Not enough games in player history. Need at least {self.sequence_length} games.")
+        
+        # Scale input
+        X = recent_games[feature_cols].values.reshape(1, self.sequence_length, -1)
+        X_reshaped = X.reshape(-1, X.shape[-1])
+        X_scaled = self.feature_scaler.transform(X_reshaped).reshape(X.shape)
+        
+        # Convert to tensor and predict
+        X_tensor = torch.FloatTensor(X_scaled).to(self.device)
+        
         self.model.eval()
         with torch.no_grad():
-            prediction = self.model(input_tensor)
+            predictions_scaled = self.model(X_tensor)
+            predictions = self.target_scaler.inverse_transform(
+                predictions_scaled.cpu().numpy()
+            )
         
-        # Convert to dictionary
-        prediction_dict = {
-            stat: pred.item()
-            for stat, pred in zip(self.target_cols, prediction[0])
+        # Format predictions
+        stats_dict = {
+            'PTS': predictions[0, 0],
+            'REB': predictions[0, 1],
+            'AST': predictions[0, 2],
+            'STL': predictions[0, 3],
+            'BLK': predictions[0, 4],
+            'MIN': predictions[0, 5]
         }
         
-        return prediction_dict
+        # Calculate fantasy points
+        stats_dict['FANTASY_PTS'] = (
+            stats_dict['PTS'] +
+            1.2 * stats_dict['REB'] +
+            1.5 * stats_dict['AST'] +
+            3.0 * stats_dict['STL'] +
+            3.0 * stats_dict['BLK']
+        )
         
-    def evaluate(
-        self,
-        test_dataset: PlayerStatsDataset
-    ) -> Dict[str, Dict[str, float]]:
+        return stats_dict
+
+    def evaluate(self, test_data: pd.DataFrame) -> Dict:
         """
         Evaluate model performance on test data.
         
         Args:
-            test_dataset (PlayerStatsDataset): Test dataset
+            test_data (pd.DataFrame): Test dataset
             
         Returns:
-            Dict[str, Dict[str, float]]: Evaluation metrics for each statistic
+            Dict: Evaluation metrics
         """
-        if self.model is None:
-            raise ValueError("Model not trained")
+        # Prepare sequences
+        X_test, y_test = self.prepare_sequences(test_data, self.sequence_length)
         
-        test_loader = DataLoader(test_dataset, batch_size=self.batch_size)
+        # Scale data
+        X_test_reshaped = X_test.reshape(-1, X_test.shape[-1])
+        X_test_scaled = self.feature_scaler.transform(X_test_reshaped).reshape(X_test.shape)
         
+        # Convert to tensor
+        X_test_tensor = torch.FloatTensor(X_test_scaled).to(self.device)
+        
+        # Make predictions
         self.model.eval()
-        predictions = []
-        actuals = []
-        
         with torch.no_grad():
-            for inputs, targets in test_loader:
-                inputs = inputs.to(self.device)
-                outputs = self.model(inputs)
-                
-                predictions.extend(outputs.cpu().numpy())
-                actuals.extend(targets.numpy())
+            predictions_scaled = self.model(X_test_tensor)
+            predictions = self.target_scaler.inverse_transform(
+                predictions_scaled.cpu().numpy()
+            )
         
-        predictions = np.array(predictions)
-        actuals = np.array(actuals)
-        
-        # Calculate metrics for each statistic
+        # Calculate metrics
         metrics = {}
-        for i, stat in enumerate(self.target_cols):
-            stat_preds = predictions[:, i]
-            stat_actuals = actuals[:, i]
+        stat_names = ['PTS', 'REB', 'AST', 'STL', 'BLK', 'MIN']
+        
+        for i, stat in enumerate(stat_names):
+            mae = mean_absolute_error(y_test[:, i], predictions[:, i])
+            rmse = np.sqrt(mean_squared_error(y_test[:, i], predictions[:, i]))
             
-            mae = np.mean(np.abs(stat_preds - stat_actuals))
-            rmse = np.sqrt(np.mean((stat_preds - stat_actuals) ** 2))
-            correlation = np.corrcoef(stat_preds, stat_actuals)[0, 1]
-            
-            metrics[stat] = {
-                'mae': mae,
-                'rmse': rmse,
-                'correlation': correlation
-            }
+            metrics[f'{stat}_MAE'] = mae
+            metrics[f'{stat}_RMSE'] = rmse
         
         return metrics
         

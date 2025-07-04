@@ -57,78 +57,135 @@ class DataLoader:
         conn = sqlite3.connect(self.team_db_path if database == 'team' else self.player_db_path)
         return pd.read_sql_query("SELECT name FROM sqlite_master WHERE type='table'", conn)['name'].tolist()
     
-    def load_team_data(self, start_date, end_date):
+    def load_team_data(self, start_date, end_date=None):
         """
-        Load team data for a specific date range.
+        Load team data from SQLite database for a given date range.
         
         Args:
             start_date (str): Start date in YYYY-MM-DD format
-            end_date (str): End date in YYYY-MM-DD format
+            end_date (str, optional): End date in YYYY-MM-DD format
             
         Returns:
             pd.DataFrame: Team statistics for the specified date range
         """
-        try:
-            conn = sqlite3.connect(self.team_db_path)
+        if end_date is None:
+            end_date = start_date
             
-            # Get all table names (dates) in the database
-            dates_query = "SELECT name FROM sqlite_master WHERE type='table'"
-            dates = pd.read_sql_query(dates_query, conn)['name'].tolist()
+        start = datetime.strptime(start_date, '%Y-%m-%d')
+        end = datetime.strptime(end_date, '%Y-%m-%d')
+        
+        dfs = []
+        current = start
+        
+        while current <= end:
+            table_name = current.strftime('%Y-%m-%d')
             
-            # Filter dates within the specified range
-            valid_dates = [
-                date for date in dates 
-                if start_date <= date <= end_date
-            ]
+            try:
+                with sqlite3.connect(self.team_db_path) as conn:
+                    query = f'SELECT * FROM "{table_name}"'
+                    df = pd.read_sql_query(query, conn)
+                    df['Date'] = table_name
+                    dfs.append(df)
+            except Exception as e:
+                self.logger.warning(f"Could not load data for {table_name}: {str(e)}")
             
-            if not valid_dates:
-                self.logger.warning(f"No data found between {start_date} and {end_date}")
-                return pd.DataFrame()
-            
-            # Load and concatenate data from each date
-            dfs = []
-            for date in valid_dates:
-                query = f'SELECT *, "{date}" as Date FROM "{date}"'
-                df = pd.read_sql_query(query, conn)
-                dfs.append(df)
-            
-            team_data = pd.concat(dfs, ignore_index=True)
-            conn.close()
-            
-            return team_data
-            
-        except Exception as e:
-            self.logger.error(f"Error loading team data: {str(e)}")
-            raise
+            current += timedelta(days=1)
+        
+        if not dfs:
+            raise ValueError(f"No data found between {start_date} and {end_date}")
+        
+        team_data = pd.concat(dfs, ignore_index=True)
+        return team_data
 
-    def load_game_data(self, start_date, end_date):
+    def load_player_data(self, start_date=None, end_date=None):
         """
-        Load game data for a specific date range.
+        Load player data from SQLite database for a given date range.
+        
+        Args:
+            start_date (str, optional): Start date in YYYY-MM-DD format
+            end_date (str, optional): End date in YYYY-MM-DD format
+            
+        Returns:
+            pd.DataFrame: Player statistics for the specified date range
+        """
+        with sqlite3.connect(self.player_db_path) as conn:
+            # Get the most recent table
+            tables = pd.read_sql_query(
+                "SELECT name FROM sqlite_master WHERE type='table'",
+                conn
+            )
+            table_name = tables['name'].max()
+            
+            query = f'SELECT * FROM "{table_name}"'
+            if start_date and end_date:
+                query += f' WHERE Date BETWEEN "{start_date}" AND "{end_date}"'
+            elif start_date:
+                query += f' WHERE Date >= "{start_date}"'
+            elif end_date:
+                query += f' WHERE Date <= "{end_date}"'
+            
+            df = pd.read_sql_query(query, conn)
+            
+            # Rename duplicate columns
+            df = df.loc[:, ~df.columns.duplicated()]
+            
+            return df
+
+    def load_game_data(self, start_date, end_date=None):
+        """
+        Load game data by combining team data into matchups.
         
         Args:
             start_date (str): Start date in YYYY-MM-DD format
-            end_date (str): End date in YYYY-MM-DD format
+            end_date (str, optional): End date in YYYY-MM-DD format
             
         Returns:
-            pd.DataFrame: Game data including matchups and outcomes
+            pd.DataFrame: Game matchup data for the specified date range
         """
-        try:
-            conn = sqlite3.connect(self.player_db_path)
+        team_data = self.load_team_data(start_date, end_date)
+        
+        # Create game matchups
+        games = []
+        dates = team_data['Date'].unique()
+        
+        for date in dates:
+            date_games = team_data[team_data['Date'] == date]
+            teams = date_games['TEAM_NAME'].unique()
             
-            query = f"""
-            SELECT * FROM dataset_2012-24 
-            WHERE Date >= '{start_date}' 
-            AND Date <= '{end_date}'
-            """
-            
-            game_data = pd.read_sql_query(query, conn)
-            conn.close()
-            
-            return game_data
-            
-        except Exception as e:
-            self.logger.error(f"Error loading game data: {str(e)}")
-            raise
+            for i in range(0, len(teams), 2):
+                if i + 1 < len(teams):
+                    home_team = teams[i]
+                    away_team = teams[i + 1]
+                    
+                    home_stats = date_games[date_games['TEAM_NAME'] == home_team].iloc[0]
+                    away_stats = date_games[date_games['TEAM_NAME'] == away_team].iloc[0]
+                    
+                    game = {
+                        'Date': date,
+                        'HOME_TEAM': home_team,
+                        'AWAY_TEAM': away_team,
+                        'HOME_PTS': home_stats['PTS'],
+                        'AWAY_PTS': away_stats['PTS'],
+                        'HOME_FG_PCT': home_stats['FG_PCT'],
+                        'AWAY_FG_PCT': away_stats['FG_PCT'],
+                        'HOME_FG3_PCT': home_stats['FG3_PCT'],
+                        'AWAY_FG3_PCT': away_stats['FG3_PCT'],
+                        'HOME_FT_PCT': home_stats['FT_PCT'],
+                        'AWAY_FT_PCT': away_stats['FT_PCT'],
+                        'HOME_REB': home_stats['REB'],
+                        'AWAY_REB': away_stats['REB'],
+                        'HOME_AST': home_stats['AST'],
+                        'AWAY_AST': away_stats['AST'],
+                        'HOME_STL': home_stats['STL'],
+                        'AWAY_STL': away_stats['STL'],
+                        'HOME_BLK': home_stats['BLK'],
+                        'AWAY_BLK': away_stats['BLK'],
+                        'HOME_TOV': home_stats['TOV'],
+                        'AWAY_TOV': away_stats['TOV']
+                    }
+                    games.append(game)
+        
+        return pd.DataFrame(games)
 
     def get_train_val_test_split(self):
         """
@@ -197,8 +254,9 @@ class DataLoader:
             else:
                 target_date = max(dates)
             
-            query = f'SELECT * FROM "{target_date}"'
+            query = f'SELECT *, "{target_date}" as Date FROM "{target_date}"'
             latest_stats = pd.read_sql_query(query, conn)
+            latest_stats['Date'] = pd.to_datetime(latest_stats['Date'])
             conn.close()
             
             return latest_stats

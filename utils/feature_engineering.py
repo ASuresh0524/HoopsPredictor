@@ -223,111 +223,160 @@ class FeatureEngineer:
             
         return df
 
-    def calculate_rolling_stats(self, team_data: pd.DataFrame) -> pd.DataFrame:
+    def calculate_rolling_stats(
+        self,
+        df: pd.DataFrame,
+        windows: Optional[List[int]] = None
+    ) -> pd.DataFrame:
         """
-        Calculate rolling statistics for each team.
+        Calculate rolling statistics for team performance metrics.
         
         Args:
-            team_data (pd.DataFrame): Team statistics data
+            df (pd.DataFrame): Team statistics dataframe
+            windows (List[int], optional): List of window sizes for rolling calculations
             
         Returns:
-            pd.DataFrame: Data with added rolling statistics
+            pd.DataFrame: DataFrame with additional rolling statistics columns
         """
-        stats_to_roll = [
-            'W_PCT', 'FG_PCT', 'FG3_PCT', 'FT_PCT', 
-            'REB', 'AST', 'TOV', 'STL', 'BLK', 'PTS', 'PLUS_MINUS'
-        ]
+        if windows is None:
+            windows = [3, 5, 10]
         
-        df = team_data.copy()
+        df = df.copy()
         df['Date'] = pd.to_datetime(df['Date'])
         
-        for window in self.rolling_windows:
-            for stat in stats_to_roll:
+        # Sort by team and date
+        df = df.sort_values(['TEAM_NAME', 'Date'])
+        
+        # Basic stats to calculate rolling averages for
+        stats = ['PTS', 'FG_PCT', 'FG3_PCT', 'FT_PCT', 'REB', 'AST', 'STL', 'BLK', 'TOV']
+        
+        for window in windows:
+            for stat in stats:
+                # Calculate rolling mean
                 df[f'{stat}_rolling_{window}'] = df.groupby('TEAM_NAME')[stat].transform(
-                    lambda x: x.rolling(window=window, min_periods=1).mean()
+                    lambda x: x.rolling(window, min_periods=1).mean()
                 )
+                
+                # Calculate rolling standard deviation
+                df[f'{stat}_rolling_std_{window}'] = df.groupby('TEAM_NAME')[stat].transform(
+                    lambda x: x.rolling(window, min_periods=1).std()
+                )
+        
+        # Calculate win/loss streak
+        df['WIN'] = (df['W'] > df['W'].shift(1)).astype(int)
+        df['STREAK'] = df.groupby('TEAM_NAME')['WIN'].transform(
+            lambda x: x.groupby((x != x.shift(1)).cumsum()).cumsum()
+        )
+        
+        # Calculate offensive and defensive ratings
+        df['POSS'] = df['FGA'] - df['OREB'] + df['TOV'] + (0.4 * df['FTA'])
+        df['OFF_RATING'] = (df['PTS'] / df['POSS']) * 100
+        df['DEF_RATING'] = (df['PTS'].shift(1) / df['POSS'].shift(1)) * 100
+        
+        # Calculate four factors
+        df['EFG_PCT'] = (df['FGM'] + 0.5 * df['FG3M']) / df['FGA']
+        df['TOV_PCT'] = df['TOV'] / (df['FGA'] + 0.44 * df['FTA'] + df['TOV'])
+        df['OREB_PCT'] = df['OREB'] / (df['OREB'] + df['DREB'].shift(1))
+        df['FT_RATE'] = df['FTA'] / df['FGA']
+        
+        # Calculate pace
+        df['PACE'] = 48 * ((df['POSS'] + df['POSS'].shift(1)) / (2 * (df['MIN'] / 5)))
+        
+        # Calculate rest days
+        df['REST_DAYS'] = df.groupby('TEAM_NAME')['Date'].diff().dt.days.fillna(0)
         
         return df
 
-    def create_game_features(
-        self, 
-        game_data: pd.DataFrame, 
-        team_data: pd.DataFrame
+    def create_matchup_features(
+        self,
+        home_team_stats: pd.DataFrame,
+        away_team_stats: pd.DataFrame
     ) -> pd.DataFrame:
         """
-        Create features for game prediction by combining team stats and game data.
+        Create features for game matchups by combining home and away team statistics.
         
         Args:
-            game_data (pd.DataFrame): Game results data
-            team_data (pd.DataFrame): Team statistics data with engineered features
+            home_team_stats (pd.DataFrame): Home team statistics
+            away_team_stats (pd.DataFrame): Away team statistics
             
         Returns:
-            pd.DataFrame: Final feature matrix for prediction
+            pd.DataFrame: Combined matchup features
         """
-        df = game_data.copy()
-        df['Date'] = pd.to_datetime(df['Date'])
+        matchup_features = pd.DataFrame()
         
-        # Add team statistics
-        team_stats = team_data.copy()
-        team_stats['Date'] = pd.to_datetime(team_stats['Date'])
+        # Basic differential features
+        stats = ['PTS', 'FG_PCT', 'FG3_PCT', 'FT_PCT', 'REB', 'AST', 'STL', 'BLK', 'TOV',
+                'OFF_RATING', 'DEF_RATING', 'PACE', 'EFG_PCT', 'TOV_PCT', 'OREB_PCT', 'FT_RATE']
         
-        # Merge home team stats
-        df = pd.merge(
-            df,
-            team_stats,
-            how='left',
-            left_on=['Date', 'TEAM_NAME'],
-            right_on=['Date', 'TEAM_NAME'],
-            suffixes=('', '_home')
-        )
+        for stat in stats:
+            if stat in home_team_stats.columns and stat in away_team_stats.columns:
+                matchup_features[f'{stat}_DIFF'] = home_team_stats[stat] - away_team_stats[stat]
         
-        # Merge away team stats
-        df = pd.merge(
-            df,
-            team_stats,
-            how='left',
-            left_on=['Date', 'TEAM_NAME.1'],
-            right_on=['Date', 'TEAM_NAME'],
-            suffixes=('_home', '_away')
-        )
+        # Rolling statistics
+        rolling_windows = [3, 5, 10]
+        for window in rolling_windows:
+            for stat in ['PTS', 'FG_PCT', 'FG3_PCT', 'FT_PCT']:
+                col = f'{stat}_rolling_{window}'
+                if col in home_team_stats.columns and col in away_team_stats.columns:
+                    matchup_features[f'{col}_DIFF'] = home_team_stats[col] - away_team_stats[col]
         
-        # Calculate differential features
-        stat_cols = [
-            'W_PCT', 'FG_PCT', 'FG3_PCT', 'FT_PCT',
-            'REB', 'AST', 'TOV', 'STL', 'BLK', 'PTS', 'PLUS_MINUS'
-        ]
+        # Streak and rest features
+        if 'STREAK' in home_team_stats.columns and 'STREAK' in away_team_stats.columns:
+            matchup_features['STREAK_DIFF'] = home_team_stats['STREAK'] - away_team_stats['STREAK']
         
-        for stat in stat_cols:
-            df[f'{stat}_diff'] = df[f'{stat}_home'] - df[f'{stat}_away']
+        if 'REST_DAYS' in home_team_stats.columns and 'REST_DAYS' in away_team_stats.columns:
+            matchup_features['REST_DIFF'] = home_team_stats['REST_DAYS'] - away_team_stats['REST_DAYS']
+        
+        return matchup_features
+
+    def prepare_game_features(
+        self,
+        games_df: pd.DataFrame,
+        team_stats_df: pd.DataFrame
+    ) -> pd.DataFrame:
+        """
+        Prepare features for game prediction by combining game data with team statistics.
+        
+        Args:
+            games_df (pd.DataFrame): DataFrame containing game matchups
+            team_stats_df (pd.DataFrame): DataFrame containing team statistics
             
-            # Add rolling and momentum differential features
-            for window in self.rolling_windows:
-                df[f'{stat}_rolling_{window}_diff'] = (
-                    df[f'{stat}_rolling_{window}_home'] - 
-                    df[f'{stat}_rolling_{window}_away']
-                )
+        Returns:
+            pd.DataFrame: Game features ready for prediction
+        """
+        features = []
+        
+        for _, game in games_df.iterrows():
+            game_date = pd.to_datetime(game['Date'])
             
-            if stat in ['PTS', 'PLUS_MINUS']:
-                for window in self.momentum_windows:
-                    if stat == 'PTS':
-                        df[f'offensive_momentum_{window}_diff'] = (
-                            df[f'offensive_momentum_{window}_home'] - 
-                            df[f'offensive_momentum_{window}_away']
-                        )
-                        df[f'defensive_momentum_{window}_diff'] = (
-                            df[f'defensive_momentum_{window}_home'] - 
-                            df[f'defensive_momentum_{window}_away']
-                        )
-                    else:
-                        df[f'point_diff_momentum_{window}_diff'] = (
-                            df[f'point_diff_momentum_{window}_home'] - 
-                            df[f'point_diff_momentum_{window}_away']
-                        )
+            # Get team stats before the game
+            home_stats = team_stats_df[
+                (team_stats_df['TEAM_NAME'] == game['HOME_TEAM']) &
+                (team_stats_df['Date'] < game_date)
+            ].sort_values('Date').iloc[-1]
+            
+            away_stats = team_stats_df[
+                (team_stats_df['TEAM_NAME'] == game['AWAY_TEAM']) &
+                (team_stats_df['Date'] < game_date)
+            ].sort_values('Date').iloc[-1]
+            
+            # Create matchup features
+            matchup_features = self.create_matchup_features(
+                home_stats.to_frame().T,
+                away_stats.to_frame().T
+            )
+            
+            # Add game metadata
+            matchup_features['Date'] = game_date
+            matchup_features['HOME_TEAM'] = game['HOME_TEAM']
+            matchup_features['AWAY_TEAM'] = game['AWAY_TEAM']
+            
+            if 'HOME_PTS' in game and 'AWAY_PTS' in game:
+                matchup_features['HOME_WIN'] = int(game['HOME_PTS'] > game['AWAY_PTS'])
+            
+            features.append(matchup_features)
         
-        # Add rest day impact
-        df['rest_advantage'] = df['Days-Rest-Home'] - df['Days-Rest-Away']
-        
-        return df
+        return pd.concat(features, ignore_index=True)
 
     def prepare_features(
         self, 
@@ -350,11 +399,11 @@ class FeatureEngineer:
         
         game_data_processed = self.calculate_head2head_features(game_data)
         
-        X = self.create_game_features(game_data_processed, team_data_processed)
+        X = self.prepare_game_features(game_data_processed, team_data_processed)
         
         # Prepare target variables
         y = pd.DataFrame({
-            'home_win': X['Home-Team-Win'],
+            'home_win': X['HOME_WIN'],
             'over_under': X['OU-Cover']
         })
         

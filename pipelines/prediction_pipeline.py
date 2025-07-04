@@ -1,308 +1,257 @@
 import pandas as pd
 import numpy as np
 from typing import Dict, List, Tuple, Optional
-import yaml
 import logging
-from datetime import datetime
-from sklearn.metrics import (
-    mean_absolute_error,
-    mean_squared_error,
-    log_loss,
-    brier_score_loss,
-    accuracy_score
-)
+import yaml
+from datetime import datetime, timedelta
+import joblib
+from pathlib import Path
 
 from utils.data_loader import DataLoader
 from utils.feature_engineering import FeatureEngineer
-from models.time_series.player_stats_model import PlayerStatsPredictor
 from models.bradley_terry.game_predictor import BradleyTerryPredictor
-
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+from models.time_series.player_stats_model import PlayerStatsPredictor
 
 class PredictionPipeline:
-    """
-    End-to-end pipeline for NBA game and player statistics prediction.
-    
-    This pipeline combines:
-    1. Data loading and preprocessing
-    2. Feature engineering
-    3. Player statistics prediction
-    4. Game outcome prediction
-    """
-    
-    def __init__(self, config_path: str = "config.yaml"):
-        """
-        Initialize the pipeline components.
-        
-        Args:
-            config_path (str): Path to configuration file
-        """
-        self.data_loader = DataLoader(config_path)
-        self.feature_engineer = FeatureEngineer(config_path)
-        self.player_predictor = PlayerStatsPredictor(config_path)
-        self.game_predictor = BradleyTerryPredictor(config_path)
-        
+    def __init__(self, config_path="config.yaml"):
+        """Initialize the prediction pipeline with configuration."""
         with open(config_path, 'r') as f:
             self.config = yaml.safe_load(f)
-            
-    def prepare_player_features(self, player_data: pd.DataFrame) -> Tuple[List[str], List[str]]:
+        
+        self.data_loader = DataLoader(config_path)
+        self.feature_engineer = FeatureEngineer(config_path)
+        self.game_predictor = BradleyTerryPredictor(config_path)
+        self.player_predictor = PlayerStatsPredictor(config_path)
+        
+        self.setup_logging()
+        self.setup_model_paths()
+
+    def setup_logging(self):
+        """Set up logging configuration."""
+        logging.basicConfig(
+            level=getattr(logging, self.config['logging']['level']),
+            format=self.config['logging']['format']
+        )
+        self.logger = logging.getLogger(__name__)
+
+    def setup_model_paths(self):
+        """Set up paths for model saving and loading."""
+        self.model_dir = Path(self.config['models']['save_dir'])
+        self.model_dir.mkdir(parents=True, exist_ok=True)
+        
+        self.game_model_path = self.model_dir / 'game_predictor.joblib'
+        self.player_model_path = self.model_dir / 'player_predictor.pt'
+
+    def train_models(self, start_date=None, end_date=None) -> Dict:
         """
-        Prepare feature and target columns for player prediction.
+        Train both game and player prediction models.
         
         Args:
-            player_data (pd.DataFrame): Raw player data
+            start_date (str, optional): Start date for training data
+            end_date (str, optional): End date for training data
             
         Returns:
-            Tuple[List[str], List[str]]: Feature and target column names
+            Dict: Training history and metrics
         """
-        # Basic stats to predict
-        target_cols = ['points', 'rebounds', 'assists', 'steals', 'blocks']
+        self.logger.info("Starting model training...")
         
-        # Features for prediction
-        feature_cols = target_cols.copy()  # Use past performance
+        # Use default dates from config if not provided
+        if start_date is None:
+            start_date = self.config['data']['train_start_date']
+        if end_date is None:
+            end_date = self.config['data']['train_end_date']
         
-        # Add engineered features
-        rolling_stats = [col for col in player_data.columns if 'rolling' in col]
-        rest_days = [col for col in player_data.columns if 'rest_days' in col]
+        # Load and prepare data
+        team_data = self.data_loader.load_team_data(start_date, end_date)
+        player_data = self.data_loader.load_player_data(start_date, end_date)
+        game_data = self.data_loader.load_game_data(start_date, end_date)
         
-        feature_cols.extend(rolling_stats)
-        feature_cols.extend(rest_days)
+        # Process team data
+        team_data_processed = self.feature_engineer.calculate_rolling_stats(team_data)
         
-        # Add game context features if available
-        context_features = ['is_home', 'games_played', 'season']
-        feature_cols.extend([col for col in context_features if col in player_data.columns])
+        # Train game predictor
+        self.logger.info("Training game predictor...")
+        game_features = self.feature_engineer.prepare_game_features(game_data, team_data_processed)
         
-        return feature_cols, target_cols
+        game_history = self.game_predictor.train(
+            game_features,
+            save_path=self.game_model_path
+        )
         
-    def prepare_game_features(self, game_data: pd.DataFrame) -> List[str]:
-        """
-        Prepare features for game outcome prediction.
-        
-        Args:
-            game_data (pd.DataFrame): Processed game data
-            
-        Returns:
-            List[str]: Feature column names
-        """
-        feature_cols = []
-        
-        # Team performance features
-        team_features = [
-            'recent_win_pct', 'point_diff_trend', 'streak',
-            'home_win_pct', 'away_win_pct'
-        ]
-        feature_cols.extend([col for col in team_features if col in game_data.columns])
-        
-        # Head-to-head features
-        h2h_features = ['h2h_games', 'h2h_home_wins']
-        feature_cols.extend([col for col in h2h_features if col in game_data.columns])
-        
-        # Rest days if available
-        rest_features = [col for col in game_data.columns if 'rest_days' in col]
-        feature_cols.extend(rest_features)
-        
-        return feature_cols
-        
-    def train(self, start_date: Optional[str] = None, end_date: Optional[str] = None):
-        """
-        Train both player stats and game outcome models.
-        
-        Args:
-            start_date (str, optional): Training start date
-            end_date (str, optional): Training end date
-        """
-        # Load and preprocess data
-        logger.info("Loading data...")
-        player_query = "SELECT * FROM player_stats"  # Customize based on your schema
-        game_query = "SELECT * FROM game_logs"  # Customize based on your schema
-        
-        player_data = self.data_loader.load_player_data(player_query)
-        game_data = self.data_loader.load_team_data(game_query)
-        
-        # Apply date filters if provided
-        if start_date:
-            start_date = pd.to_datetime(start_date)
-            player_data = player_data[player_data['game_date'] >= start_date]
-            game_data = game_data[game_data['game_date'] >= start_date]
-            
-        if end_date:
-            end_date = pd.to_datetime(end_date)
-            player_data = player_data[player_data['game_date'] <= end_date]
-            game_data = game_data[game_data['game_date'] <= end_date]
-            
-        # Preprocess data
-        logger.info("Preprocessing data...")
-        player_data = self.data_loader.preprocess_player_data(player_data)
-        game_data = self.data_loader.preprocess_team_data(game_data)
-        
-        # Feature engineering
-        logger.info("Engineering features...")
-        player_data = self.feature_engineer.calculate_rolling_averages(
+        # Train player predictor
+        self.logger.info("Training player predictor...")
+        player_history = self.player_predictor.train(
             player_data,
-            ['points', 'rebounds', 'assists', 'steals', 'blocks'],
-            'player_id'
-        )
-        player_data = self.feature_engineer.add_rest_days_feature(player_data)
-        
-        game_data = self.feature_engineer.calculate_team_momentum(game_data)
-        game_data = self.feature_engineer.calculate_head2head_features(game_data)
-        game_data = self.feature_engineer.add_home_court_features(game_data)
-        
-        # Prepare features
-        player_features, player_targets = self.prepare_player_features(player_data)
-        game_features = self.prepare_game_features(game_data)
-        
-        # Split data
-        player_splits = self.data_loader.get_train_val_test_split(player_data)
-        game_splits = self.data_loader.get_train_val_test_split(game_data)
-        
-        # Train player stats model
-        logger.info("Training player stats model...")
-        train_features, train_targets = self.player_predictor.prepare_sequences(
-            player_splits['train'],
-            player_features,
-            player_targets
+            save_path=self.player_model_path
         )
         
-        val_features, val_targets = self.player_predictor.prepare_sequences(
-            player_splits['val'],
-            player_features,
-            player_targets
-        )
-        
-        train_loader = self.player_predictor.create_data_loaders(train_features, train_targets)
-        val_loader = self.player_predictor.create_data_loaders(val_features, val_targets)
-        
-        self.player_predictor.train(train_loader, val_loader)
-        
-        # Train game outcome model
-        logger.info("Training game outcome model...")
-        self.game_predictor.fit(
-            game_splits['train'],
-            'home_team_id',
-            'away_team_id',
-            'home_team_won',
-            game_features
-        )
-        
-        logger.info("Training completed successfully")
-        
-    def predict_game(self, 
-                    home_team: str,
-                    away_team: str,
-                    game_date: str,
-                    player_stats: Optional[pd.DataFrame] = None) -> Dict:
-        """
-        Make predictions for a specific game.
-        
-        Args:
-            home_team (str): Home team identifier
-            away_team (str): Away team identifier
-            game_date (str): Game date
-            player_stats (pd.DataFrame, optional): Recent player statistics
-            
-        Returns:
-            Dict: Predictions including game outcome and player statistics
-        """
-        predictions = {
-            'game_date': game_date,
-            'home_team': home_team,
-            'away_team': away_team
+        return {
+            'game_history': game_history,
+            'player_history': player_history
         }
-        
-        # Predict game outcome
-        game_features = None  # Prepare game features based on recent data
-        win_prob = self.game_predictor.predict_proba(home_team, away_team, game_features)
-        predictions['home_win_probability'] = float(win_prob)
-        
-        # Predict player stats if data provided
-        if player_stats is not None:
-            player_features, _ = self.prepare_player_features(player_stats)
-            features = self.player_predictor._prepare_features(player_stats[player_features])
-            player_predictions = self.player_predictor.predict(features)
-            
-            predictions['player_stats'] = {
-                player_id: stats for player_id, stats in 
-                zip(player_stats['player_id'].unique(), player_predictions)
-            }
-            
-        return predictions
-        
-    def evaluate(self, 
-                 player_data: pd.DataFrame,
-                 game_data: pd.DataFrame) -> Dict[str, float]:
+
+    def predict_game(
+        self,
+        home_team: str,
+        away_team: str,
+        date: Optional[str] = None
+    ) -> Dict:
         """
-        Evaluate model performance on test data.
+        Predict the outcome of a game between two teams.
         
         Args:
-            player_data (pd.DataFrame): Player test data
-            game_data (pd.DataFrame): Game test data
+            home_team (str): Home team name/code
+            away_team (str): Away team name/code
+            date (str, optional): Game date in YYYY-MM-DD format
             
         Returns:
-            Dict[str, float]: Evaluation metrics
+            Dict: Prediction results including win probability and expected stats
         """
-        metrics = {}
+        if date is None:
+            date = datetime.now().strftime('%Y-%m-%d')
         
-        # Evaluate player stats predictions
-        player_features, player_targets = self.prepare_player_features(player_data)
-        features = self.player_predictor._prepare_features(player_data[player_features])
-        predictions = self.player_predictor.predict(features)
+        # Load recent team data
+        start_date = (datetime.strptime(date, '%Y-%m-%d') - timedelta(days=30)).strftime('%Y-%m-%d')
+        team_data = self.data_loader.load_team_data(start_date, date)
         
-        for i, stat in enumerate(player_targets):
-            metrics[f'{stat}_mae'] = mean_absolute_error(
-                player_data[stat],
-                predictions[:, i]
-            )
-            metrics[f'{stat}_rmse'] = np.sqrt(mean_squared_error(
-                player_data[stat],
-                predictions[:, i]
-            ))
+        # Process team data
+        team_data_processed = self.feature_engineer.calculate_rolling_stats(team_data)
+        
+        # Create game features
+        game_df = pd.DataFrame([{
+            'Date': date,
+            'HOME_TEAM': home_team,
+            'AWAY_TEAM': away_team
+        }])
+        
+        game_features = self.feature_engineer.prepare_game_features(
+            game_df,
+            team_data_processed
+        )
+        
+        # Make predictions
+        predictions = self.game_predictor.predict(game_features)
+        
+        # Get team stats
+        home_stats = team_data_processed[
+            team_data_processed['TEAM_NAME'] == home_team
+        ].iloc[-1]
+        
+        away_stats = team_data_processed[
+            team_data_processed['TEAM_NAME'] == away_team
+        ].iloc[-1]
+        
+        return {
+            'home_win_probability': float(predictions['win_probability']),
+            'predicted_spread': float(predictions['spread']),
+            'predicted_total': float(predictions['total']),
+            'home_team_stats': {
+                'recent_pts': float(home_stats['PTS_rolling_5']),
+                'off_rating': float(home_stats['OFF_RATING']),
+                'def_rating': float(home_stats['DEF_RATING']),
+                'pace': float(home_stats['PACE'])
+            },
+            'away_team_stats': {
+                'recent_pts': float(away_stats['PTS_rolling_5']),
+                'off_rating': float(away_stats['OFF_RATING']),
+                'def_rating': float(away_stats['DEF_RATING']),
+                'pace': float(away_stats['PACE'])
+            }
+        }
+
+    def predict_player_stats(
+        self,
+        player_name: str,
+        team: str,
+        opponent: str,
+        date: Optional[str] = None
+    ) -> Dict:
+        """
+        Predict statistics for a player in an upcoming game.
+        
+        Args:
+            player_name (str): Player's name
+            team (str): Player's team name/code
+            opponent (str): Opponent team name/code
+            date (str, optional): Game date in YYYY-MM-DD format
             
-        # Evaluate game outcome predictions
-        game_features = self.prepare_game_features(game_data)
-        game_probs = [
-            self.game_predictor.predict_proba(
-                row['home_team_id'],
-                row['away_team_id'],
-                game_features[i:i+1] if game_features else None
-            )
-            for i, row in game_data.iterrows()
+        Returns:
+            Dict: Predicted statistics for the player
+        """
+        if date is None:
+            date = datetime.now().strftime('%Y-%m-%d')
+        
+        # Load recent player data
+        start_date = (datetime.strptime(date, '%Y-%m-%d') - timedelta(days=90)).strftime('%Y-%m-%d')
+        player_data = self.data_loader.load_player_data(start_date, date)
+        
+        # Filter for the specific player
+        player_history = player_data[
+            (player_data['PLAYER_NAME'] == player_name) &
+            (player_data['TEAM_NAME'] == team)
         ]
         
-        metrics['game_log_loss'] = log_loss(
-            game_data['home_team_won'],
-            game_probs
-        )
-        metrics['game_brier_score'] = brier_score_loss(
-            game_data['home_team_won'],
-            game_probs
-        )
-        metrics['game_accuracy'] = accuracy_score(
-            game_data['home_team_won'],
-            [p > 0.5 for p in game_probs]
+        if len(player_history) == 0:
+            raise ValueError(f"No data found for player {player_name} on team {team}")
+        
+        # Make predictions
+        predictions = self.player_predictor.predict(
+            player_history,
+            opponent,
+            date
         )
         
-        return metrics
-        
-    def save_models(self, player_model_path: str, game_model_path: str):
+        return {
+            'points': float(predictions['PTS']),
+            'rebounds': float(predictions['REB']),
+            'assists': float(predictions['AST']),
+            'steals': float(predictions['STL']),
+            'blocks': float(predictions['BLK']),
+            'minutes': float(predictions['MIN']),
+            'fantasy_points': float(predictions['FANTASY_PTS'])
+        }
+
+    def evaluate_models(
+        self,
+        start_date: Optional[str] = None,
+        end_date: Optional[str] = None
+    ) -> Dict:
         """
-        Save both models to disk.
+        Evaluate both game and player prediction models on a test period.
         
         Args:
-            player_model_path (str): Path to save player stats model
-            game_model_path (str): Path to save game outcome model
+            start_date (str, optional): Start date for evaluation in YYYY-MM-DD format
+            end_date (str, optional): End date for evaluation in YYYY-MM-DD format
+            
+        Returns:
+            Dict: Evaluation metrics for both models
         """
-        self.player_predictor.save_model(player_model_path)
-        self.game_predictor.save_model(game_model_path)
+        # Use default test dates from config if not provided
+        if start_date is None:
+            start_date = self.config['data']['test_start_date']
+        if end_date is None:
+            end_date = self.config['data']['test_end_date']
         
-    def load_models(self, player_model_path: str, game_model_path: str):
-        """
-        Load both models from disk.
+        # Load test data
+        team_data = self.data_loader.load_team_data(start_date, end_date)
+        player_data = self.data_loader.load_player_data(start_date, end_date)
+        game_data = self.data_loader.load_game_data(start_date, end_date)
         
-        Args:
-            player_model_path (str): Path to player stats model
-            game_model_path (str): Path to game outcome model
-        """
-        self.player_predictor.load_model(player_model_path)
-        self.game_predictor.load_model(game_model_path) 
+        # Process team data
+        team_data_processed = self.feature_engineer.calculate_rolling_stats(team_data)
+        
+        # Evaluate game predictor
+        game_features = self.feature_engineer.prepare_game_features(
+            game_data,
+            team_data_processed
+        )
+        
+        game_metrics = self.game_predictor.evaluate(game_features)
+        
+        # Evaluate player predictor
+        player_metrics = self.player_predictor.evaluate(player_data)
+        
+        return {
+            'game_metrics': game_metrics,
+            'player_metrics': player_metrics
+        } 

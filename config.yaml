@@ -1,34 +1,35 @@
 data:
   team_data_path: "TeamData.sqlite"
   player_data_path: "dataset.sqlite"
-  train_start_date: "2012-01-01"
-  train_end_date: "2023-06-30"
+  train_start_date: "2023-10-24"  # Start of 2023-24 season
+  train_end_date: "2024-04-14"    # End of 2023-24 regular season
   val_start_date: "2023-07-01"
   val_end_date: "2023-12-31"
-  test_start_date: "2024-01-01"
-  test_end_date: "2024-04-29"
+  test_start_date: "2024-04-15"   # Start of playoffs
+  test_end_date: "2024-04-29"     # Current date
 
 feature_engineering:
-  rolling_windows: [5, 10, 20]
-  momentum_windows: [3, 5, 10]
+  rolling_windows: [3, 5, 10]
+  momentum_windows: [5, 10]
+  min_games: 5
   head2head_lookback_days: 365
 
 models:
-  bradley_terry:
-    learning_rate: 0.01
-    max_iterations: 1000
-    convergence_threshold: 1e-6
-    regularization: 0.1
-
-  time_series:
-    lstm:
-      hidden_size: 128
-      num_layers: 2
-      dropout: 0.2
-      learning_rate: 0.001
-      batch_size: 32
-      epochs: 50
-      sequence_length: 10
+  save_dir: "models/saved"
+  game_predictor:
+    learning_rate: 0.001
+    batch_size: 32
+    epochs: 50
+    early_stopping_patience: 5
+  player_predictor:
+    learning_rate: 0.001
+    hidden_size: 128
+    num_layers: 2
+    dropout: 0.2
+    batch_size: 32
+    epochs: 50
+    sequence_length: 10
+    early_stopping_patience: 5
 
 evaluation:
   metrics:
@@ -40,5 +41,5 @@ evaluation:
     - brier_score
 
 logging:
-  level: INFO
+  level: "INFO"
   format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s" 
