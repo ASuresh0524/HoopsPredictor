@@ -160,31 +160,76 @@ class DataLoader:
                     home_stats = date_games[date_games['TEAM_NAME'] == home_team].iloc[0]
                     away_stats = date_games[date_games['TEAM_NAME'] == away_team].iloc[0]
                     
+                    # Calculate point differential and win/loss
+                    point_differential = home_stats['PTS'] - away_stats['PTS']
+                    home_win = int(point_differential > 0)
+                    
                     game = {
-                        'Date': date,
-                        'HOME_TEAM': home_team,
-                        'AWAY_TEAM': away_team,
-                        'HOME_PTS': home_stats['PTS'],
-                        'AWAY_PTS': away_stats['PTS'],
-                        'HOME_FG_PCT': home_stats['FG_PCT'],
-                        'AWAY_FG_PCT': away_stats['FG_PCT'],
-                        'HOME_FG3_PCT': home_stats['FG3_PCT'],
-                        'AWAY_FG3_PCT': away_stats['FG3_PCT'],
-                        'HOME_FT_PCT': home_stats['FT_PCT'],
-                        'AWAY_FT_PCT': away_stats['FT_PCT'],
-                        'HOME_REB': home_stats['REB'],
-                        'AWAY_REB': away_stats['REB'],
-                        'HOME_AST': home_stats['AST'],
-                        'AWAY_AST': away_stats['AST'],
-                        'HOME_STL': home_stats['STL'],
-                        'AWAY_STL': away_stats['STL'],
-                        'HOME_BLK': home_stats['BLK'],
-                        'AWAY_BLK': away_stats['BLK'],
-                        'HOME_TOV': home_stats['TOV'],
-                        'AWAY_TOV': away_stats['TOV']
+                        'game_id': f"{date}_{home_team}_{away_team}",
+                        'game_date': date,
+                        'home_team_id': home_stats['TEAM_ID'],
+                        'away_team_id': away_stats['TEAM_ID'],
+                        'team_name': home_team,
+                        'team_name.1': away_team,
+                        'pts': home_stats['PTS'],
+                        'pts.1': away_stats['PTS'],
+                        'fg_pct': home_stats['FG_PCT'],
+                        'fg_pct.1': away_stats['FG_PCT'],
+                        'fg3_pct': home_stats['FG3_PCT'],
+                        'fg3_pct.1': away_stats['FG3_PCT'],
+                        'ft_pct': home_stats['FT_PCT'],
+                        'ft_pct.1': away_stats['FT_PCT'],
+                        'reb': home_stats['REB'],
+                        'reb.1': away_stats['REB'],
+                        'ast': home_stats['AST'],
+                        'ast.1': away_stats['AST'],
+                        'stl': home_stats['STL'],
+                        'stl.1': away_stats['STL'],
+                        'blk': home_stats['BLK'],
+                        'blk.1': away_stats['BLK'],
+                        'tov': home_stats['TOV'],
+                        'tov.1': away_stats['TOV'],
+                        'point_differential': point_differential,
+                        'won': home_win,
+                        'is_home': 1
                     }
                     games.append(game)
+                    
+                    # Add reverse matchup for away team perspective
+                    away_game = game.copy()
+                    away_game.update({
+                        'game_id': f"{date}_{away_team}_{home_team}",
+                        'home_team_id': away_stats['TEAM_ID'],
+                        'away_team_id': home_stats['TEAM_ID'],
+                        'team_name': away_team,
+                        'team_name.1': home_team,
+                        'pts': away_stats['PTS'],
+                        'pts.1': home_stats['PTS'],
+                        'fg_pct': away_stats['FG_PCT'],
+                        'fg_pct.1': home_stats['FG_PCT'],
+                        'fg3_pct': away_stats['FG3_PCT'],
+                        'fg3_pct.1': home_stats['FG3_PCT'],
+                        'ft_pct': away_stats['FT_PCT'],
+                        'ft_pct.1': home_stats['FT_PCT'],
+                        'reb': away_stats['REB'],
+                        'reb.1': home_stats['REB'],
+                        'ast': away_stats['AST'],
+                        'ast.1': home_stats['AST'],
+                        'stl': away_stats['STL'],
+                        'stl.1': home_stats['STL'],
+                        'blk': away_stats['BLK'],
+                        'blk.1': home_stats['BLK'],
+                        'tov': away_stats['TOV'],
+                        'tov.1': home_stats['TOV'],
+                        'point_differential': -point_differential,
+                        'won': 1 - home_win,
+                        'is_home': 0
+                    })
+                    games.append(away_game)
         
+        if not games:
+            raise ValueError(f"No games found between {start_date} and {end_date}")
+            
         return pd.DataFrame(games)
 
     def get_train_val_test_split(self):
@@ -267,7 +312,7 @@ class DataLoader:
         
     def preprocess_team_data(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Preprocess team-level data with standard cleaning operations.
+        Preprocess team data by cleaning and standardizing column names.
         
         Args:
             df (pd.DataFrame): Raw team data
@@ -275,22 +320,61 @@ class DataLoader:
         Returns:
             pd.DataFrame: Preprocessed team data
         """
-        # Ensure datetime columns are properly formatted
-        date_columns = df.select_dtypes(include=['datetime64']).columns
-        for col in date_columns:
-            df[col] = pd.to_datetime(df[col])
-            
-        # Handle missing values
-        numeric_columns = df.select_dtypes(include=[np.number]).columns
-        df[numeric_columns] = df[numeric_columns].fillna(df[numeric_columns].mean())
+        df = df.copy()
         
-        # Add season identifier if not present
-        if 'season' not in df.columns and 'game_date' in df.columns:
-            df['season'] = df['game_date'].dt.year.where(
-                df['game_date'].dt.month < 8,
-                df['game_date'].dt.year + 1
-            )
+        # Convert date to datetime and rename to game_date
+        df['game_date'] = pd.to_datetime(df['Date'])
+        df = df.drop('Date', axis=1)
+        
+        # Rename columns to lowercase
+        df.columns = df.columns.str.lower()
+        
+        # Rename team ID column
+        if 'team_id' not in df.columns and 'team_name' in df.columns:
+            # Create a mapping of team names to IDs if needed
+            team_names = df['team_name'].unique()
+            team_id_map = {name: str(i+1).zfill(3) for i, name in enumerate(sorted(team_names))}
+            df['team_id'] = df['team_name'].map(team_id_map)
+        
+        # Ensure required columns exist
+        required_cols = [
+            'team_id', 'team_name', 'pts', 'fg_pct', 'fg3_pct', 'ft_pct',
+            'reb', 'ast', 'stl', 'blk', 'tov', 'game_date'
+        ]
+        
+        # Create mapping for any missing columns
+        col_mapping = {
+            'pts': 'pts',
+            'fg_pct': 'fg_pct',
+            'fg3_pct': 'fg3_pct',
+            'ft_pct': 'ft_pct',
+            'reb': 'reb',
+            'ast': 'ast',
+            'stl': 'stl',
+            'blk': 'blk',
+            'tov': 'tov',
+            'team_id': 'team_id',
+            'team_name': 'team_name'
+        }
+        
+        # Apply column mapping
+        df = df.rename(columns=col_mapping)
+        
+        # Check for missing required columns
+        missing_cols = [col for col in required_cols if col not in df.columns]
+        if missing_cols:
+            raise ValueError(f"Missing required columns: {missing_cols}")
             
+        # Calculate additional metrics
+        if 'off_rating' not in df.columns:
+            df['off_rating'] = df['pts'] / (df['fg_pct'] + df['fg3_pct'] + df['ft_pct'])
+            
+        if 'def_rating' not in df.columns:
+            df['def_rating'] = df['pts'] / (df['reb'] + df['stl'] + df['blk'])
+            
+        # Sort by date and team
+        df = df.sort_values(['game_date', 'team_name'])
+        
         return df
         
     def preprocess_player_data(self, df: pd.DataFrame) -> pd.DataFrame:

@@ -119,9 +119,13 @@ class PredictionPipeline:
         
         # Create game features
         game_df = pd.DataFrame([{
-            'Date': date,
-            'HOME_TEAM': home_team,
-            'AWAY_TEAM': away_team
+            'game_date': date,
+            'game_id': f"{date}_{home_team}_{away_team}",
+            'home_team_id': home_team,  # Using team name as ID for now
+            'away_team_id': away_team,
+            'team_name': home_team,
+            'team_name.1': away_team,
+            'is_home': 1
         }])
         
         game_features = self.feature_engineer.prepare_game_features(
@@ -134,11 +138,11 @@ class PredictionPipeline:
         
         # Get team stats
         home_stats = team_data_processed[
-            team_data_processed['TEAM_NAME'] == home_team
+            team_data_processed['team_name'] == home_team
         ].iloc[-1]
         
         away_stats = team_data_processed[
-            team_data_processed['TEAM_NAME'] == away_team
+            team_data_processed['team_name'] == away_team
         ].iloc[-1]
         
         return {
@@ -146,16 +150,16 @@ class PredictionPipeline:
             'predicted_spread': float(predictions['spread']),
             'predicted_total': float(predictions['total']),
             'home_team_stats': {
-                'recent_pts': float(home_stats['PTS_rolling_5']),
-                'off_rating': float(home_stats['OFF_RATING']),
-                'def_rating': float(home_stats['DEF_RATING']),
-                'pace': float(home_stats['PACE'])
+                'recent_pts': float(home_stats['pts_rolling_5']),
+                'off_rating': float(home_stats['off_rating']),
+                'def_rating': float(home_stats['def_rating']),
+                'pace': float(home_stats.get('pace', 0))
             },
             'away_team_stats': {
-                'recent_pts': float(away_stats['PTS_rolling_5']),
-                'off_rating': float(away_stats['OFF_RATING']),
-                'def_rating': float(away_stats['DEF_RATING']),
-                'pace': float(away_stats['PACE'])
+                'recent_pts': float(away_stats['pts_rolling_5']),
+                'off_rating': float(away_stats['off_rating']),
+                'def_rating': float(away_stats['def_rating']),
+                'pace': float(away_stats.get('pace', 0))
             }
         }
 
@@ -187,8 +191,8 @@ class PredictionPipeline:
         
         # Filter for the specific player
         player_history = player_data[
-            (player_data['PLAYER_NAME'] == player_name) &
-            (player_data['TEAM_NAME'] == team)
+            (player_data['player_name'] == player_name) &
+            (player_data['team_name'] == team)
         ]
         
         if len(player_history) == 0:
@@ -202,13 +206,13 @@ class PredictionPipeline:
         )
         
         return {
-            'points': float(predictions['PTS']),
-            'rebounds': float(predictions['REB']),
-            'assists': float(predictions['AST']),
-            'steals': float(predictions['STL']),
-            'blocks': float(predictions['BLK']),
-            'minutes': float(predictions['MIN']),
-            'fantasy_points': float(predictions['FANTASY_PTS'])
+            'points': float(predictions['pts']),
+            'rebounds': float(predictions['reb']),
+            'assists': float(predictions['ast']),
+            'steals': float(predictions['stl']),
+            'blocks': float(predictions['blk']),
+            'minutes': float(predictions['min']),
+            'fantasy_points': float(predictions['fantasy_pts'])
         }
 
     def evaluate_models(
